@@ -2106,7 +2106,7 @@ fn fetchCatalogForProvider(
 }
 
 fn finishCatalogWithCustomModels(alloc: Allocator, existing: *std.ArrayList(model_catalog.ModelCatalogEntry), view: ModelCatalogView) model_catalog.ProviderResult {
-    // Load Pi config and append its models, deduplicating by id
+    // Load custom config and append its models, deduplicating by id
     if (custom_provider.loadCustomConfig(alloc, null)) |*cfg| {
         var custom_cfg = cfg.*;
         defer custom_cfg.deinit(alloc);
@@ -2152,7 +2152,7 @@ fn finishCatalogWithCustomModels(alloc: Allocator, existing: *std.ArrayList(mode
             }
         }
     } else |_| {
-        // Pi config load failed (file missing) - ignore
+        // Custom config load failed (file missing) - ignore
     }
 
     if (existing.items.len == 0) {
