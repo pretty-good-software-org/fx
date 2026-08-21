@@ -2087,10 +2087,11 @@ fn fetchCatalogForProvider(
         switch (response) {
             .success => |body| {
                 defer alloc.free(body);
-                catalog = parseModelCatalogForView(alloc, body, input.view) catch |err| {
+                if (parseModelCatalogForView(alloc, body, input.view)) |parsed| {
+                    catalog = parsed;
+                } else |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    std.ArrayList(model_catalog.ModelCatalogEntry).empty
-                };
+                }
             },
             .http_status => {},
         }
