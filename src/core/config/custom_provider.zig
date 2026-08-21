@@ -205,7 +205,7 @@ pub fn loadCustomConfig(alloc: Allocator, custom_path: ?[]const u8) !CustomConfi
             defer fb.close(io_mod.getIo());
             const content = try io_mod.readFileToEnd(alloc, &fb, 1024 * 1024);
             defer alloc.free(content);
-            return try parseCustomConfigJson(alloc, content);
+            return try parseCustomConfigJsonWithOptions(alloc, content, use_default_fallback);
         },
         else => return err,
     };
@@ -217,10 +217,14 @@ pub fn loadCustomConfig(alloc: Allocator, custom_path: ?[]const u8) !CustomConfi
     };
     defer alloc.free(content);
 
-    return try parseCustomConfigJson(alloc, content);
+    return try parseCustomConfigJsonWithOptions(alloc, content, use_default_fallback);
 }
 
 pub fn parseCustomConfigJson(alloc: Allocator, json_bytes: []const u8) !CustomConfig {
+    return parseCustomConfigJsonWithOptions(alloc, json_bytes, true);
+}
+
+fn parseCustomConfigJsonWithOptions(alloc: Allocator, json_bytes: []const u8, allow_commands: bool) !CustomConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
 
@@ -254,8 +258,10 @@ pub fn parseCustomConfigJson(alloc: Allocator, json_bytes: []const u8) !CustomCo
         if (prov_obj.object.get("apiKey")) |v| {
             if (v == .string) {
                 provider.apiKeyRaw = try alloc.dupe(u8, v.string);
-                if (try resolveApiKeyValue(alloc, v.string)) |resolved| {
-                    provider.apiKeyResolved = resolved;
+                if (allow_commands or !std.mem.startsWith(u8, v.string, "!")) {
+                    if (try resolveApiKeyValue(alloc, v.string)) |resolved| {
+                        provider.apiKeyResolved = resolved;
+                    }
                 }
             }
         }

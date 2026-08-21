@@ -8,53 +8,36 @@ pub const StreamChunkCallback = *const fn (ctx: *anyopaque, chunk: []const u8) v
 
 /// Extract prompt from Gateway payload (prompt array or input string)
 pub fn extractPromptFromPayload(alloc: Allocator, payload: []const u8) ![]u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch {
-        return try alloc.dupe(u8, payload[0..@min(payload.len, 4000)]);
-    };
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) {
-        return try alloc.dupe(u8, payload[0..@min(payload.len, 4000)]);
-    }
-    const prompt_key = parsed.value.object.get("prompt") orelse parsed.value.object.get("messages") orelse parsed.value.object.get("input");
-    if (prompt_key) |pk| {
-        if (pk == .array) {
-            var i = pk.array.items.len;
-            while (i > 0) {
-                i -= 1;
-                const msg = pk.array.items[i];
-                if (msg != .object) continue;
-                const role = msg.object.get("role") orelse continue;
-                if (role != .string) continue;
-                if (!std.mem.eql(u8, role.string, "user")) continue;
-                const content = msg.object.get("content") orelse continue;
-                if (content == .string) {
-                    return try alloc.dupe(u8, content.string);
-                } else if (content == .array) {
-                    for (content.array.items) |block| {
-                        if (block == .object) {
-                            if (block.object.get("text")) |txt| {
-                                if (txt == .string) return try alloc.dupe(u8, txt.string);
-                            }
-                            if (block.object.get("content")) |c2| {
-                                if (c2 == .string) return try alloc.dupe(u8, c2.string);
-                            }
-                        }
-                    }
-                }
-            }
-            if (pk.array.items.len > 0) {
-                const last = pk.array.items[pk.array.items.len - 1];
-                if (last == .object) {
-                    if (last.object.get("content")) |c| {
-                        if (c == .string) return try alloc.dupe(u8, c.string);
-                    }
-                }
-            }
-        } else if (pk == .string) {
-            return try alloc.dupe(u8, pk.string);
+    if (parsed.value != .object) return error.MissingPrompt;
+    const prompt_key = parsed.value.object.get("prompt") orelse
+        parsed.value.object.get("messages") orelse
+        parsed.value.object.get("input") orelse return error.MissingPrompt;
+    if (prompt_key == .string) return try alloc.dupe(u8, prompt_key.string);
+    if (prompt_key != .array) return error.MissingPrompt;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    for (prompt_key.array.items) |item| {
+        if (item != .object) continue;
+        const role = item.object.get("role") orelse continue;
+        if (role != .string) continue;
+        const content = item.object.get("content") orelse continue;
+        try out.appendSlice(alloc, role.string);
+        try out.appendSlice(alloc, ": ");
+        if (content == .string) {
+            try out.appendSlice(alloc, content.string);
+        } else {
+            var encoded = std.Io.Writer.Allocating.init(alloc);
+            defer encoded.deinit();
+            try std.json.Stringify.value(content, .{}, &encoded.writer);
+            try out.appendSlice(alloc, encoded.written());
         }
+        try out.append(alloc, '\n');
     }
-    return try alloc.dupe(u8, payload[0..@min(payload.len, 4000)]);
+    if (out.items.len == 0) return error.MissingPrompt;
+    return out.toOwnedSlice(alloc);
 }
 
 pub fn resolveCustomModel(alloc: Allocator, model_id: []const u8) !?struct {
