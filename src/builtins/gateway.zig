@@ -28,6 +28,8 @@ const web_search_provider = @import("../core/tooling/web_search_provider.zig");
 const gateway_schema = @import("../core/tooling/gateway_schema.zig");
 const tool_advertisement = @import("../core/tooling/tool_advertisement.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
+const custom_provider = @import("../core/config/custom_provider.zig");
+const custom_client = @import("../gateway/custom_client.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -428,6 +430,54 @@ fn streamAgentCompletion(
     if (request.credential_source == .chatgpt_subscription) {
         return error.CodexCredentialCannotAuthorizeGateway;
     }
+    if (custom_provider.loadCustomConfig(alloc, null)) |loaded_cfg| {
+        var custom_cfg = loaded_cfg;
+        defer custom_cfg.deinit(alloc);
+        if (custom_cfg.findModel(request.model)) |found| {
+            const prompt = custom_client.extractPromptFromPayload(alloc, request.payload) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return err;
+            };
+            defer alloc.free(prompt);
+
+            var collected = std.ArrayList(u8).empty;
+            const Collector = struct {
+                list: *std.ArrayList(u8),
+                alloc: Allocator,
+                base_cb: agent_stream_provider_contract.StreamCallback,
+                base_ctx: *anyopaque,
+                pub fn onChunk(ctx: *anyopaque, chunk: []const u8) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx));
+                    self.list.appendSlice(self.alloc, chunk) catch {};
+                    self.base_cb(self.base_ctx, chunk);
+                }
+            };
+            var collector = Collector{
+                .list = &collected,
+                .alloc = alloc,
+                .base_cb = request.on_content_chunk,
+                .base_ctx = request.callback_ctx,
+            };
+            custom_client.streamViaDirectHttp(alloc, found.provider.*, found.model.*, prompt, @ptrCast(&collector), Collector.onChunk) catch |err| {
+                collected.deinit(alloc);
+                return err;
+            };
+            const content = try collected.toOwnedSlice(alloc);
+            return .{
+                .status = .ok,
+                .completion = .{
+                    .content = content,
+                    .finish_reason = .stop,
+                    .usage = .{ .input_tokens = 0, .output_tokens = 0 },
+                },
+                .generation_origin = "custom-direct",
+                .ownership = .owned,
+            };
+        }
+    } else |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+    }
+
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
@@ -2032,28 +2082,91 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
-    const response = fetchModelCatalogResponse(
-        alloc,
-        input.access,
-        input.endpoint,
-        input.cancel_flag,
-    ) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = catalogRequestFailure(err) };
-    };
-    const json_text = switch (response) {
-        .success => |body| body,
-        .http_status => |status| return .{
-            .failure = model_catalog.failureForHttpStatus(status),
-        },
-    };
-    defer alloc.free(json_text);
+    var catalog = std.ArrayList(model_catalog.ModelCatalogEntry).empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &catalog);
 
-    const catalog = parseModelCatalogForView(alloc, json_text, input.view) catch |err| {
+    if (fetchModelCatalogResponse(alloc, input.access, input.endpoint, input.cancel_flag)) |response| {
+        switch (response) {
+            .success => |body| {
+                defer alloc.free(body);
+                if (parseModelCatalogForView(alloc, body, input.view)) |parsed| {
+                    catalog = parsed;
+                } else |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                }
+            },
+            .http_status => {},
+        }
+    } else |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
-    };
-    return .{ .catalog = catalog };
+        const failure = catalogRequestFailure(err);
+        if (failure.category == .cancellation) return .{ .failure = failure };
+    }
+    return finishCatalogWithCustomModels(alloc, &catalog, input.view);
+}
+
+fn finishCatalogWithCustomModels(alloc: Allocator, existing: *std.ArrayList(model_catalog.ModelCatalogEntry), view: ModelCatalogView) model_catalog.ProviderResult {
+    // Load custom config and append its models, deduplicating by id
+    if (custom_provider.loadCustomConfig(alloc, null)) |*cfg| {
+        var custom_cfg = cfg.*;
+        defer custom_cfg.deinit(alloc);
+        for (custom_cfg.providers) |*prov| {
+            for (prov.models) |*pm| {
+                const full_id = std.fmt.allocPrint(alloc, "{s}/{s}", .{ prov.name, pm.id }) catch continue;
+                // Deduplicate: skip if id already exists in Gateway catalog
+                var exists = false;
+                for (existing.items) |e| {
+                    if (std.mem.eql(u8, e.id, full_id)) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (exists) {
+                    alloc.free(full_id);
+                    continue;
+                }
+                const entry = model_catalog.ModelCatalogEntry{
+                    .id = full_id,
+                    .model_type = alloc.dupe(u8, "language") catch {
+                        alloc.free(full_id);
+                        continue;
+                    },
+                    .has_reasoning = pm.reasoning,
+                    .has_tool_use = true,
+                    .has_vision = blk: {
+                        if (pm.input) |inp| {
+                            for (inp) |i| {
+                                if (std.mem.eql(u8, i, "image")) break :blk true;
+                            }
+                        }
+                        break :blk false;
+                    },
+                    .context_window = pm.contextWindow orelse 0,
+                    .max_tokens = pm.maxTokens orelse 0,
+                };
+                existing.append(alloc, entry) catch {
+                    alloc.free(entry.id);
+                    alloc.free(entry.model_type);
+                    continue;
+                };
+            }
+        }
+    } else |_| {
+        // Custom config load failed (file missing) - ignore
+    }
+
+    if (existing.items.len == 0) {
+        return .{ .failure = .{ .category = .transport, .retryable = true } };
+    }
+    sort_utils.sort(ModelCatalogEntry, existing.items, {}, model_catalog.compareModelCatalogEntries);
+    if (view == .picker) {
+        const projected = model_catalog.projectPickerModelCatalog(alloc, existing.items) catch |err| {
+            return .{ .failure = .{ .category = if (err == error.OutOfMemory) .resource_exhausted else .transport, .retryable = false } };
+        };
+        model_catalog.freeModelCatalog(alloc, existing);
+        return .{ .catalog = projected };
+    }
+    return .{ .catalog = existing.* };
 }
 
 fn fetchModelIdsForView(

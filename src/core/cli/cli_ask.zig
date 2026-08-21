@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
@@ -30,6 +31,8 @@ const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const custom_provider = @import("../config/custom_provider.zig");
+const custom_client = @import("../../gateway/custom_client.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
@@ -86,6 +89,14 @@ const ask_presentation = @import("../../ui/ask_presentation.zig");
 const url_opener = @import("../hosts/url_opener.zig");
 
 const Allocator = std.mem.Allocator;
+
+fn isCustomConfiguredModel(alloc: Allocator, model_id: []const u8) bool {
+    if (custom_provider.loadCustomConfig(alloc, null)) |*config_ptr| {
+        var config = config_ptr.*;
+        defer config.deinit(alloc);
+        return config.findModel(model_id) != null;
+    } else |_| return false;
+}
 const BackgroundRuntime = background_runtime.BackgroundRuntime;
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
@@ -1439,7 +1450,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     try checkHeadlessCancellation(options.deps);
 
     if (!options.continue_recovery and options.resume_target == null and startup.credential == null) {
-        return missingCredentialResult(alloc, options, startup.provider);
+        if (!isCustomConfiguredModel(alloc, startup.selected_model)) {
+            return missingCredentialResult(alloc, options, startup.provider);
+        }
     }
 
     var owned_resumed_model: ?[]u8 = null;
@@ -1528,7 +1541,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         false;
     const credential: *const credentials.Credential = if (startup_matches_final_model)
         &startup.credential.?
-    else routed: {
+    else if (isCustomConfiguredModel(alloc, startup.selected_model)) custom: {
+        routed_credential = .{
+            .token = try alloc.dupe(u8, "custom-direct"),
+            .source = .ai_gateway_api_key,
+        };
+        break :custom &routed_credential.?;
+    } else routed: {
         const preferred = if (startup.credential) |value| value.source else null;
         const resolution = try credentials.resolveForProvider(
             alloc,
