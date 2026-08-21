@@ -40,71 +40,6 @@ pub fn extractPromptFromPayload(alloc: Allocator, payload: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-pub fn resolveCustomModel(alloc: Allocator, model_id: []const u8) !?struct {
-    provider: custom_provider.CustomProvider,
-    model: custom_provider.CustomModel,
-    config: custom_provider.CustomConfig,
-} {
-    var cfg = try custom_provider.loadCustomConfig(alloc, null);
-    errdefer cfg.deinit(alloc);
-
-    if (cfg.findModel(model_id)) |_| {
-        var owned_cfg = cfg;
-        const found2 = owned_cfg.findModel(model_id).?;
-        var prov = custom_provider.CustomProvider{
-            .name = try alloc.dupe(u8, found2.provider.name),
-            .baseUrl = if (found2.provider.baseUrl) |b| try alloc.dupe(u8, b) else null,
-            .api = found2.provider.api,
-            .apiKeyRaw = if (found2.provider.apiKeyRaw) |r| try alloc.dupe(u8, r) else null,
-            .apiKeyResolved = if (found2.provider.apiKeyResolved) |res| try alloc.dupe(u8, res) else null,
-            .models = &.{},
-        };
-        errdefer prov.deinit(alloc);
-        var m = custom_provider.CustomModel{
-            .id = try alloc.dupe(u8, found2.model.id),
-            .name = if (found2.model.name) |n| try alloc.dupe(u8, n) else null,
-            .baseUrl = if (found2.model.baseUrl) |b| try alloc.dupe(u8, b) else null,
-            .api = found2.model.api,
-            .reasoning = found2.model.reasoning,
-            .contextWindow = found2.model.contextWindow,
-            .maxTokens = found2.model.maxTokens,
-            .input = if (found2.model.input) |input| blk: {
-                var cloned = try alloc.alloc([]u8, input.len);
-                errdefer alloc.free(cloned);
-                var count: usize = 0;
-                errdefer for (cloned[0..count]) |value| alloc.free(value);
-                for (input) |value| {
-                    cloned[count] = try alloc.dupe(u8, value);
-                    count += 1;
-                }
-                break :blk cloned;
-            } else null,
-        };
-        errdefer m.deinit(alloc);
-        owned_cfg.deinit(alloc);
-        return .{
-            .provider = prov,
-            .model = m,
-            .config = custom_provider.CustomConfig{},
-        };
-    }
-
-    cfg.deinit(alloc);
-    return null;
-}
-
-pub fn isCustomModel(model_id: []const u8) bool {
-    // Heuristic: check if id looks like custom (e.g., contains spark or meta/ prefix)
-    // Full check will be done via config lookup
-    if (std.mem.indexOf(u8, model_id, "muse-spark") != null) return true;
-    if (std.mem.startsWith(u8, model_id, "meta/")) return true;
-    if (std.mem.startsWith(u8, model_id, "custom/")) return true;
-    // Also try config lookup (may be heavy, but ok for isCustom check)
-    // We do quick check without allocs: if file exists and contains model id, assume custom
-    // For now, heuristic is enough – real check happens in stream path via loadCustomConfig
-    return false;
-}
-
 /// Direct HTTP client for custom providers (openai-responses compatible, e.g., Meta Model API)
 pub fn streamViaDirectHttp(
     alloc: Allocator,
@@ -278,28 +213,4 @@ pub fn streamViaDirectHttp(
         // Fallback: return raw body
         on_chunk(callback_ctx, resp_body);
     }
-}
-
-/// Legacy wrapper that still spawns external CLI if direct HTTP fails – kept for compatibility but now uses direct HTTP
-pub fn streamViaExternalCli(
-    alloc: Allocator,
-    model: []const u8,
-    prompt: []const u8,
-    callback_ctx: *anyopaque,
-    on_chunk: StreamChunkCallback,
-) !void {
-    // Try direct HTTP path first via custom config
-    if (try resolveCustomModel(alloc, model)) |resolved| {
-        var prov = resolved.provider;
-        var m = resolved.model;
-        defer prov.deinit(alloc);
-        defer m.deinit(alloc);
-        var cfg = resolved.config;
-        defer cfg.deinit(alloc);
-
-        return try streamViaDirectHttp(alloc, prov, m, prompt, callback_ctx, on_chunk);
-    }
-
-    // Fallback: if model not in custom config, return error to let Gateway handle it
-    return error.ModelNotFoundInCustomConfig;
 }
