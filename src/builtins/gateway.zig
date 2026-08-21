@@ -430,50 +430,52 @@ fn streamAgentCompletion(
     if (request.credential_source == .chatgpt_subscription) {
         return error.CodexCredentialCannotAuthorizeGateway;
     }
-    // Custom provider check: if model is from ~/.fx/models.json, delegate to direct HTTP client
-    if (custom_client.isCustomModel(request.model)) {
-        if (custom_provider.loadCustomConfig(alloc, null)) |*cfg| {
-            var custom_cfg = cfg.*;
-            defer custom_cfg.deinit(alloc);
-            if (custom_cfg.findModel(request.model)) |_| {
-                const prompt = custom_client.extractPromptFromPayload(alloc, request.payload) catch try alloc.dupe(u8, request.payload);
-                defer alloc.free(prompt);
+    if (custom_provider.loadCustomConfig(alloc, null)) |loaded_cfg| {
+        var custom_cfg = loaded_cfg;
+        defer custom_cfg.deinit(alloc);
+        if (custom_cfg.findModel(request.model)) |found| {
+            const prompt = custom_client.extractPromptFromPayload(alloc, request.payload) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return err;
+            };
+            defer alloc.free(prompt);
 
-                var collected = std.ArrayList(u8).empty;
-                const Collector = struct {
-                    list: *std.ArrayList(u8),
-                    alloc: Allocator,
-                    base_cb: agent_stream_provider_contract.StreamCallback,
-                    base_ctx: *anyopaque,
-                    pub fn onChunk(ctx: *anyopaque, chunk: []const u8) void {
-                        const self: *@This() = @ptrCast(@alignCast(ctx));
-                        self.list.appendSlice(self.alloc, chunk) catch {};
-                        self.base_cb(self.base_ctx, chunk);
-                    }
-                };
-                var collector = Collector{
-                    .list = &collected,
-                    .alloc = alloc,
-                    .base_cb = request.on_content_chunk,
-                    .base_ctx = request.callback_ctx,
-                };
-                custom_client.streamViaExternalCli(alloc, request.model, prompt, @ptrCast(&collector), Collector.onChunk) catch |err| {
-                    collected.deinit(alloc);
-                    return err;
-                };
-                const content = try collected.toOwnedSlice(alloc);
-                return .{
-                    .status = .ok,
-                    .completion = .{
-                        .content = content,
-                        .finish_reason = .stop,
-                        .usage = .{ .input_tokens = 0, .output_tokens = 0 },
-                    },
-                    .generation_origin = "custom-direct",
-                    .ownership = .owned,
-                };
-            }
-        } else |_| {}
+            var collected = std.ArrayList(u8).empty;
+            const Collector = struct {
+                list: *std.ArrayList(u8),
+                alloc: Allocator,
+                base_cb: agent_stream_provider_contract.StreamCallback,
+                base_ctx: *anyopaque,
+                pub fn onChunk(ctx: *anyopaque, chunk: []const u8) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx));
+                    self.list.appendSlice(self.alloc, chunk) catch {};
+                    self.base_cb(self.base_ctx, chunk);
+                }
+            };
+            var collector = Collector{
+                .list = &collected,
+                .alloc = alloc,
+                .base_cb = request.on_content_chunk,
+                .base_ctx = request.callback_ctx,
+            };
+            custom_client.streamViaDirectHttp(alloc, found.provider.*, found.model.*, prompt, @ptrCast(&collector), Collector.onChunk) catch |err| {
+                collected.deinit(alloc);
+                return err;
+            };
+            const content = try collected.toOwnedSlice(alloc);
+            return .{
+                .status = .ok,
+                .completion = .{
+                    .content = content,
+                    .finish_reason = .stop,
+                    .usage = .{ .input_tokens = 0, .output_tokens = 0 },
+                },
+                .generation_origin = "custom-direct",
+                .ownership = .owned,
+            };
+        }
+    } else |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
     }
 
     const result = gateway_client.streamGatewayCompletion(
@@ -2097,11 +2099,13 @@ fn fetchCatalogForProvider(
         }
     } else |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        const failure = catalogRequestFailure(err);
+        if (failure.category == .cancellation) return .{ .failure = failure };
     }
-    return finishCatalogWithPi(alloc, &catalog);
+    return finishCatalogWithCustomModels(alloc, &catalog, input.view);
 }
 
-fn finishCatalogWithPi(alloc: Allocator, existing: *std.ArrayList(model_catalog.ModelCatalogEntry)) model_catalog.ProviderResult {
+fn finishCatalogWithCustomModels(alloc: Allocator, existing: *std.ArrayList(model_catalog.ModelCatalogEntry), view: ModelCatalogView) model_catalog.ProviderResult {
     // Load Pi config and append its models, deduplicating by id
     if (custom_provider.loadCustomConfig(alloc, null)) |*cfg| {
         var custom_cfg = cfg.*;
@@ -2123,7 +2127,7 @@ fn finishCatalogWithPi(alloc: Allocator, existing: *std.ArrayList(model_catalog.
                 }
                 const entry = model_catalog.ModelCatalogEntry{
                     .id = full_id,
-                    .model_type = std.fmt.allocPrint(alloc, "{s}", .{full_id}) catch {
+                    .model_type = alloc.dupe(u8, "language") catch {
                         alloc.free(full_id);
                         continue;
                     },
@@ -2153,6 +2157,14 @@ fn finishCatalogWithPi(alloc: Allocator, existing: *std.ArrayList(model_catalog.
 
     if (existing.items.len == 0) {
         return .{ .failure = .{ .category = .transport, .retryable = true } };
+    }
+    sort_utils.sort(ModelCatalogEntry, existing.items, {}, model_catalog.compareModelCatalogEntries);
+    if (view == .picker) {
+        const projected = model_catalog.projectPickerModelCatalog(alloc, existing.items) catch |err| {
+            return .{ .failure = .{ .category = if (err == error.OutOfMemory) .resource_exhausted else .transport, .retryable = false } };
+        };
+        model_catalog.freeModelCatalog(alloc, existing);
+        return .{ .catalog = projected };
     }
     return .{ .catalog = existing.* };
 }

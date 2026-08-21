@@ -91,14 +91,12 @@ const url_opener = @import("../hosts/url_opener.zig");
 const Allocator = std.mem.Allocator;
 
 fn isCustomConfiguredModel(alloc: Allocator, model_id: []const u8) bool {
-    if (model_id.len > 0 and custom_client.isCustomModel(model_id)) return true;
     if (custom_provider.loadCustomConfig(alloc, null)) |*config_ptr| {
         var config = config_ptr.*;
         defer config.deinit(alloc);
         return config.findModel(model_id) != null;
     } else |_| return false;
 }
-
 const BackgroundRuntime = background_runtime.BackgroundRuntime;
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;

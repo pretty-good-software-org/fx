@@ -55,7 +55,10 @@ pub const CustomProvider = struct {
     pub fn deinit(self: *CustomProvider, alloc: Allocator) void {
         alloc.free(self.name);
         if (self.baseUrl) |v| alloc.free(v);
-        if (self.apiKeyRaw) |v| alloc.free(v);
+        if (self.apiKeyRaw) |v| {
+            @memset(v, 0);
+            alloc.free(v);
+        }
         if (self.apiKeyResolved) |v| {
             @memset(v, 0);
             alloc.free(v);
@@ -92,15 +95,6 @@ pub const CustomConfig = struct {
                 }
             }
         }
-        if (provider_hint != null) {
-            for (self.providers) |*prov| {
-                for (prov.models) |*m| {
-                    if (std.mem.eql(u8, m.id, search_id) or std.mem.eql(u8, m.id, model_id)) {
-                        return .{ .provider = prov, .model = m };
-                    }
-                }
-            }
-        }
         return null;
     }
 };
@@ -114,6 +108,10 @@ pub fn resolveApiKeyValue(alloc: Allocator, raw: []const u8) !?[]u8 {
         }) catch return null;
         defer alloc.free(result.stdout);
         defer alloc.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code != 0) return null,
+            else => return null,
+        }
         const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
         if (trimmed.len == 0) return null;
         return try alloc.dupe(u8, trimmed);
@@ -176,7 +174,6 @@ pub fn resolveApiKeyValue(alloc: Allocator, raw: []const u8) !?[]u8 {
 fn resolveConfigPath(alloc: Allocator, custom_path: ?[]const u8) !?[]u8 {
     if (custom_path) |p| return try alloc.dupe(u8, p);
     if (io_mod.getenv("FX_MODELS_PATH")) |p| return try alloc.dupe(u8, p);
-    if (io_mod.getenv("FX_CUSTOM_MODELS_PATH")) |p| return try alloc.dupe(u8, p);
     const home = io_mod.getenv("HOME") orelse return null;
 
     // Try ~/.fx/models.json first
@@ -191,11 +188,13 @@ pub fn loadCustomConfig(alloc: Allocator, custom_path: ?[]const u8) !CustomConfi
     defer if (maybe_path) |p| alloc.free(p);
 
     const path = maybe_path orelse return CustomConfig{};
+    const use_default_fallback = custom_path == null and io_mod.getenv("FX_MODELS_PATH") == null;
 
-    // Try primary path, then fallback to providers.json
+    // Try primary path, then the legacy fallback only for the default path.
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{ .mode = .read_only }) catch |err| switch (err) {
-        error.FileNotFound => {
-            // Try fallback ~/.fx/providers.json
+        error.FileNotFound => if (!use_default_fallback) {
+            return CustomConfig{};
+        } else {
             const home = io_mod.getenv("HOME") orelse return CustomConfig{};
             const fallback = try std.fs.path.join(alloc, &.{ home, ".fx", "providers.json" });
             defer alloc.free(fallback);
@@ -204,7 +203,7 @@ pub fn loadCustomConfig(alloc: Allocator, custom_path: ?[]const u8) !CustomConfi
                 else => return e,
             };
             defer fb.close(io_mod.getIo());
-            const content = io_mod.readFileToEnd(alloc, &fb, 1024 * 1024) catch return CustomConfig{};
+            const content = try io_mod.readFileToEnd(alloc, &fb, 1024 * 1024);
             defer alloc.free(content);
             return try parseCustomConfigJson(alloc, content);
         },
@@ -291,10 +290,10 @@ pub fn parseCustomConfigJson(alloc: Allocator, json_bytes: []const u8) !CustomCo
                         if (r == .bool) m.reasoning = r.bool;
                     }
                     if (model_item.object.get("contextWindow")) |cw| {
-                        if (cw == .integer) m.contextWindow = @intCast(cw.integer);
+                        if (cw == .integer) m.contextWindow = std.math.cast(u32, cw.integer);
                     }
                     if (model_item.object.get("maxTokens")) |mt| {
-                        if (mt == .integer) m.maxTokens = @intCast(mt.integer);
+                        if (mt == .integer) m.maxTokens = std.math.cast(u32, mt.integer);
                     }
                     if (model_item.object.get("input")) |inp| {
                         if (inp == .array) {

@@ -68,7 +68,7 @@ pub fn resolveCustomModel(alloc: Allocator, model_id: []const u8) !?struct {
     if (cfg.findModel(model_id)) |_| {
         var owned_cfg = cfg;
         const found2 = owned_cfg.findModel(model_id).?;
-        const prov = custom_provider.CustomProvider{
+        var prov = custom_provider.CustomProvider{
             .name = try alloc.dupe(u8, found2.provider.name),
             .baseUrl = if (found2.provider.baseUrl) |b| try alloc.dupe(u8, b) else null,
             .api = found2.provider.api,
@@ -76,7 +76,8 @@ pub fn resolveCustomModel(alloc: Allocator, model_id: []const u8) !?struct {
             .apiKeyResolved = if (found2.provider.apiKeyResolved) |res| try alloc.dupe(u8, res) else null,
             .models = &.{},
         };
-        const m = custom_provider.CustomModel{
+        errdefer prov.deinit(alloc);
+        var m = custom_provider.CustomModel{
             .id = try alloc.dupe(u8, found2.model.id),
             .name = if (found2.model.name) |n| try alloc.dupe(u8, n) else null,
             .baseUrl = if (found2.model.baseUrl) |b| try alloc.dupe(u8, b) else null,
@@ -84,7 +85,19 @@ pub fn resolveCustomModel(alloc: Allocator, model_id: []const u8) !?struct {
             .reasoning = found2.model.reasoning,
             .contextWindow = found2.model.contextWindow,
             .maxTokens = found2.model.maxTokens,
+            .input = if (found2.model.input) |input| blk: {
+                var cloned = try alloc.alloc([]u8, input.len);
+                errdefer alloc.free(cloned);
+                var count: usize = 0;
+                errdefer for (cloned[0..count]) |value| alloc.free(value);
+                for (input) |value| {
+                    cloned[count] = try alloc.dupe(u8, value);
+                    count += 1;
+                }
+                break :blk cloned;
+            } else null,
         };
+        errdefer m.deinit(alloc);
         owned_cfg.deinit(alloc);
         return .{
             .provider = prov,
@@ -126,7 +139,7 @@ pub fn streamViaDirectHttp(
     const endpoint = switch (api_type) {
         .openai_responses => "/responses",
         .openai_completions => "/chat/completions",
-        .anthropic_messages => "/messages",
+        .anthropic_messages => return error.UnsupportedApiType,
         else => "/responses",
     };
 
@@ -140,16 +153,21 @@ pub fn streamViaDirectHttp(
     try std.json.Stringify.value(prompt, .{}, &prompt_json.writer);
     const prompt_json_slice = try prompt_json.toOwnedSlice();
     defer alloc.free(prompt_json_slice);
+    var model_json = std.Io.Writer.Allocating.init(alloc);
+    defer model_json.deinit();
+    try std.json.Stringify.value(model.id, .{}, &model_json.writer);
+    const model_json_slice = try model_json.toOwnedSlice();
+    defer alloc.free(model_json_slice);
 
     var body: []u8 = undefined;
     if (api_type == .openai_completions) {
         body = try std.fmt.allocPrint(alloc,
-            \\{{"model":"{s}","messages":[{{"role":"user","content":{s}}}]}}
-        , .{ model.id, prompt_json_slice });
+            \\{{"model":{s},"messages":[{{"role":"user","content":{s}}}]}}
+        , .{ model_json_slice, prompt_json_slice });
     } else {
         body = try std.fmt.allocPrint(alloc,
-            \\{{"model":"{s}","input":{s}}}
-        , .{ model.id, prompt_json_slice });
+            \\{{"model":{s},"input":{s}}}
+        , .{ model_json_slice, prompt_json_slice });
     }
     defer alloc.free(body);
 
