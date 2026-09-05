@@ -66,6 +66,9 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("build_options", build_options.createModule());
 
+    const otel_sdk = b.dependency("opentelemetry", .{});
+    exe.root_module.addImport("opentelemetry-sdk", otel_sdk.module("sdk"));
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -89,6 +92,18 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    const otel_sdk_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/otel_sdk_compile.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    otel_sdk_test.root_module.addImport("opentelemetry-sdk", otel_sdk.module("sdk"));
+    const run_otel_sdk_test = b.addRunArtifact(otel_sdk_test);
+    const otel_sdk_test_step = b.step("otel-sdk-test", "Compile and test the pinned native OpenTelemetry SDK");
+    otel_sdk_test_step.dependOn(&run_otel_sdk_test.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
