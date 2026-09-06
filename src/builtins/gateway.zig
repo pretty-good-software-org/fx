@@ -2277,6 +2277,9 @@ test "catalog request failures preserve transport and cancellation facts" {
 
     const malformed = catalogRequestFailure(error.HttpHeadersInvalid);
     try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, malformed.category);
+
+    const malformed_json = catalogRequestFailure(error.MalformedResponse);
+    try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, malformed_json.category);
 }
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
