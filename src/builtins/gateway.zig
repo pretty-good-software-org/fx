@@ -2085,22 +2085,19 @@ fn fetchCatalogForProvider(
     var catalog = std.ArrayList(model_catalog.ModelCatalogEntry).empty;
     errdefer model_catalog.freeModelCatalog(alloc, &catalog);
 
-    if (fetchModelCatalogResponse(alloc, input.access, input.endpoint, input.cancel_flag)) |response| {
-        switch (response) {
-            .success => |body| {
-                defer alloc.free(body);
-                if (parseModelCatalogForView(alloc, body, input.view)) |parsed| {
-                    catalog = parsed;
-                } else |err| {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                }
-            },
-            .http_status => {},
-        }
-    } else |err| {
+    const response = fetchModelCatalogResponse(alloc, input.access, input.endpoint, input.cancel_flag) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        const failure = catalogRequestFailure(err);
-        if (failure.category == .cancellation) return .{ .failure = failure };
+        return .{ .failure = catalogRequestFailure(err) };
+    };
+    switch (response) {
+        .success => |body| {
+            defer alloc.free(body);
+            catalog = parseModelCatalogForView(alloc, body, input.view) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return .{ .failure = .{ .category = .malformed_response } };
+            };
+        },
+        .http_status => |status| return .{ .failure = model_catalog.failureForHttpStatus(status) },
     }
     return finishCatalogWithCustomModels(alloc, &catalog, input.view);
 }
@@ -2155,9 +2152,6 @@ fn finishCatalogWithCustomModels(alloc: Allocator, existing: *std.ArrayList(mode
         // Custom config load failed (file missing) - ignore
     }
 
-    if (existing.items.len == 0) {
-        return .{ .failure = .{ .category = .transport, .retryable = true } };
-    }
     sort_utils.sort(ModelCatalogEntry, existing.items, {}, model_catalog.compareModelCatalogEntries);
     if (view == .picker) {
         const projected = model_catalog.projectPickerModelCatalog(alloc, existing.items) catch |err| {
@@ -2255,6 +2249,7 @@ fn catalogRequestFailure(err: anyerror) model_catalog.Failure {
 
 fn isInvalidGatewayResponse(err: anyerror) bool {
     return switch (err) {
+        error.MalformedResponse,
         error.HttpConnectionHeaderUnsupported,
         error.HttpContentEncodingUnsupported,
         error.HttpHeaderContinuationsUnsupported,
@@ -2282,6 +2277,9 @@ test "catalog request failures preserve transport and cancellation facts" {
 
     const malformed = catalogRequestFailure(error.HttpHeadersInvalid);
     try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, malformed.category);
+
+    const malformed_json = catalogRequestFailure(error.MalformedResponse);
+    try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, malformed_json.category);
 }
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {
